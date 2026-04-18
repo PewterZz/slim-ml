@@ -39,6 +39,10 @@ def run(
     prompt: str = typer.Option("Hello, how are you?"),
     max_tokens: int = typer.Option(128),
     temperature: float = typer.Option(0.7),
+    kv_bits: Optional[int] = typer.Option(
+        None, help="Quantize KV cache to N bits (MLX: 4 or 8). None = off."
+    ),
+    kv_start: int = typer.Option(0, help="Step to begin quantizing KV (keep first N FP16)."),
     headroom_gb: float = typer.Option(4.0),
     log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
 ):
@@ -57,7 +61,12 @@ def run(
     be.load(model, spec, budget)
 
     session = Session(backend=be, budget=budget, spec=spec, recorder=recorder)
-    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+    settings = GenerationSettings(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        kv_bits=kv_bits,
+        quantized_kv_start=kv_start,
+    )
 
     try:
         for tok in session.generate(prompt, settings):
@@ -236,6 +245,70 @@ def spec(
         session.close()
 
 
+@app.command("spec-sweep")
+def spec_sweep(
+    model: str = typer.Argument(..., help="HF repo id or local path (MLX)"),
+    draft: str = typer.Option(..., help="Draft model for speculation"),
+    prompt: str = typer.Option(
+        "Write a Python function that takes a list of integers and returns "
+        "the median. Handle even-length lists by averaging the two middle "
+        "elements. Include a docstring and type hints."
+    ),
+    num_drafts: str = typer.Option("1,2,4,6,8", help="Comma-separated num_draft values to sweep"),
+    max_tokens: int = typer.Option(96),
+    temperature: float = typer.Option(0.0),
+    headroom_gb: float = typer.Option(4.0),
+):
+    """Sweep num_draft values, report which maximizes speedup for this model pair.
+
+    Loads models once, reuses across runs. Prints a table keyed by num_draft.
+    """
+    be = MLXBackend()
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+
+    console.print(f"[cyan]loading[/cyan] target={model}  draft={draft}")
+    be.load(model, None, budget)
+    be.load_draft(draft)
+    session = Session(backend=be, budget=budget, recorder=NullRecorder())
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+
+    try:
+        t0 = time.monotonic()
+        n_base = 0
+        for _ in session.generate(prompt, settings):
+            n_base += 1
+        t_base = time.monotonic() - t0
+        tps_base = n_base / t_base if t_base > 0 else 0.0
+        console.print(f"[bold]baseline[/bold] tokens={n_base} time={t_base:.2f}s tps={tps_base:.1f}")
+
+        table = Table(title="num_draft sweep")
+        table.add_column("n_draft", justify="right")
+        table.add_column("tps", justify="right")
+        table.add_column("speedup", justify="right")
+        table.add_column("from_draft", justify="right")
+
+        values = [int(x) for x in num_drafts.split(",")]
+        for n in values:
+            t0 = time.monotonic()
+            n_tok = 0
+            accepted = 0
+            for tok in session.generate_speculative(prompt, settings, num_draft=n):
+                if tok.token_id == -1:
+                    continue
+                n_tok += 1
+                if tok.from_draft:
+                    accepted += 1
+            dt = time.monotonic() - t0
+            tps = n_tok / dt if dt > 0 else 0.0
+            speedup = tps / tps_base if tps_base > 0 else 0.0
+            rate = (accepted / n_tok * 100) if n_tok else 0.0
+            table.add_row(str(n), f"{tps:.1f}", f"{speedup:.2f}×", f"{rate:.1f}%")
+        console.print(table)
+    finally:
+        session.close()
+
+
 @app.command()
 def techniques():
     """List registered techniques and their implementation status."""
@@ -243,7 +316,7 @@ def techniques():
     table.add_column("Name"); table.add_column("Target"); table.add_column("Status")
     table.add_row("expert_cache", "v0", "interface sketched")
     table.add_row("spec_decode", "v1", "shipped (MLX, hybrid-attention supported)")
-    table.add_row("kv_quant", "v2", "stub")
+    table.add_row("kv_quant", "v2", "runtime knob shipped (--kv-bits); Technique interface TBD")
     table.add_row("layer_stream", "v2", "stub")
     console.print(table)
 

@@ -44,15 +44,26 @@ slim-ml spec NexVeridian/OmniCoder-9B-4bit \
 At `--temperature 0.0` the CLI runs baseline + spec back-to-back and asserts
 identical token sequences before reporting speedup.
 
-Measured on M3 Air 16GB (April 2026, `num_draft=2`, temp=0):
-| Target | Draft | Speedup | Accept |
-|---|---|---|---|
-| OmniCoder 9B 4bit (hybrid) | Qwen3.5-0.8B 4bit | 1.18× | 55.2% |
-| Qwen2.5-Coder-7B 4bit | Qwen2.5-Coder-1.5B 4bit | 1.55× | 62.5% |
+Measured on M3 Air 16GB (April 2026, temp=0):
 
-The hybrid ceiling (~1.15-1.2×) is lower because 24/32 layers are
-linear-attention and can't batch-verify; only the 8 full-attention layers
-benefit from parallel verification.
+| Target | Draft | num_draft | Speedup | Accept |
+|---|---|---|---|---|
+| OmniCoder 9B 4bit (hybrid) | Qwen3.5-0.8B 4bit | 1 | **1.43×** | 44.8% |
+| OmniCoder 9B 4bit (hybrid) | Qwen3.5-0.8B 4bit | 2 | 1.25× | 55.2% |
+| OmniCoder 9B 4bit (hybrid) | Qwen3.5-0.8B 4bit | 4 | 0.62× | 46.9% |
+| Qwen2.5-Coder-7B 4bit | Qwen2.5-Coder-1.5B 4bit | 2 | 1.55× | 62.5% |
+
+Use `slim-ml spec-sweep` to pick the best `num_draft` for your pair — on
+OmniCoder `num_draft=1` wins because drafts cost less to run and rejections
+carry a heavy replay tax (24/32 layers are linear-attention and replay
+sequentially). The hybrid ceiling (~1.4× at best) stays below the pure-KV
+ceiling (1.55×+) for that same reason.
+
+```bash
+slim-ml spec-sweep NexVeridian/OmniCoder-9B-4bit \
+  --draft mlx-community/Qwen3.5-0.8B-MLX-4bit \
+  --num-drafts "1,2,4"
+```
 
 Programmatic use:
 
@@ -77,6 +88,26 @@ for tok in session.generate_speculative(
 With `log=<path>.jsonl` on the `Session`, each verify round emits a
 `spec_round` event with `{num_draft, num_accept, verify_ms, replay_ms}` for
 per-round profiling.
+
+## KV cache quantization
+
+`slim-ml run --kv-bits {4,8}` wires mlx-lm's quantized KV cache through
+`GenerationSettings`. Use `--kv-start N` to keep the first N decoded steps
+FP16 before quantizing (reduces early-token drift).
+
+Honest measurement (April 2026, OmniCoder 9B 4bit, 256 tokens, M3 Air):
+
+| setting | tps | peak mem | note |
+|---|---|---|---|
+| baseline (FP16 KV) | 6.6 | 5.22 GB | |
+| `--kv-bits 8` | 4.3 | 5.22 GB | 34% slower, no mem savings |
+| `--kv-bits 4` | 4.9 | 5.22 GB | 26% slower, no mem savings |
+
+The knob is shipped but **not a win on this config**: hybrid attention means
+only 8/32 layers have a quantizable KV cache, and at 256-token context the
+peak is dominated by model weights, not KV. Expected win cases: pure-KV
+models (Qwen2.5-Coder), long context (>4k tokens), or tight-memory regimes
+where trading tps for headroom unblocks a bigger model.
 
 ## Install
 

@@ -26,6 +26,9 @@ class GenerationSettings:
     temperature: float = 0.7
     top_p: float = 0.95
     seed: Optional[int] = None
+    kv_bits: Optional[int] = None
+    kv_group_size: int = 64
+    quantized_kv_start: int = 0
 
 
 @dataclass
@@ -139,6 +142,10 @@ class MLXBackend(Backend):
         )
         if prompt_cache is not None:
             kwargs["prompt_cache"] = prompt_cache
+        if settings.kv_bits is not None:
+            kwargs["kv_bits"] = settings.kv_bits
+            kwargs["kv_group_size"] = settings.kv_group_size
+            kwargs["quantized_kv_start"] = settings.quantized_kv_start
         for resp in stream_generate(self._model, self._tokenizer, **kwargs):
             yield Token(text=resp.text, token_id=resp.token, logprob=None)
 
