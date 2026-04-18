@@ -172,6 +172,16 @@ Shipped as an opt-in CLI command to keep the negative result
 reproducible. Do not reach for it; reach for `pld` (no draft model) or
 `spec` (with draft, copy-from-prompt workloads excluded).
 
+**Load sensitivity:** speculation on MLX unified memory is fragile to
+system contention. Back-to-back same-session measurements on a loaded
+M3 Air (baseline dropped from ~18 tps to ~6 tps due to background
+processes) showed PLD regress to **0.80×** and hybrid to **0.51×** on
+the dataclass workload — both flipped sign. The "hybrid worse than PLD"
+conclusion holds in both clean and contended regimes (hybrid speedup
+is roughly 0.65× of PLD's speedup either way), but users running on
+loaded laptops may see any speculation regress below baseline. The
+reported numbers are clean-room upper bounds, not floors.
+
 ## KV cache quantization
 
 `slim-ml run --kv-bits {4,8}` wires mlx-lm's quantized KV cache through
