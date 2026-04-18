@@ -202,6 +202,23 @@ peak is dominated by model weights, not KV. Expected win cases: pure-KV
 models (Qwen2.5-Coder), long context (>4k tokens), or tight-memory regimes
 where trading tps for headroom unblocks a bigger model.
 
+**Long-context correctness gate (April 2026, Qwen2.5-Coder-7B 4bit,
+~2800-token prompt, 256 output tokens, temp=0):**
+
+| setting | prefill (s) | mean tps | correctness |
+|---|---|---|---|
+| baseline (FP16 KV) | 52.9 | 4.71 | — |
+| `--kv-bits 8` | 41.3 | 3.55 | **FAIL** — diverges from baseline at ~token 9 |
+| `--kv-bits 4` | 40.5 | 4.43 | **FAIL** — diverges from baseline at token 1 |
+
+KV-quant saves ~12s on prefill (smaller cache = less bandwidth) but
+**corrupts output at temp=0** on a 2800-token context. The quantization
+error accumulates enough over 2800 prefill tokens to shift the model's
+first decode choice. On short context (256 tokens, the earlier OmniCoder
+test) the drift was tolerable; on long context it's not. KV-quant on
+MLX is currently a memory-headroom trade, not a speed win, and it's
+unsafe for correctness-sensitive workloads beyond ~1K context.
+
 ## Expert caching (Stage 0: observation)
 
 Expert-cache migration is the primary v0 technique — for MoE models where
