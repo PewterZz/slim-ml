@@ -33,6 +33,7 @@ class Token:
     text: str
     token_id: int
     logprob: Optional[float] = None
+    from_draft: Optional[bool] = None
 
 
 PromptCache = Any
@@ -73,6 +74,22 @@ class Backend(ABC):
     def supports_kv_hooks(self) -> bool:
         return False
 
+    def supports_speculative(self) -> bool:
+        return False
+
+    def load_draft(self, draft_ref: str) -> None:
+        raise NotImplementedError(f"{self.name}: draft model loading not implemented")
+
+    def generate_speculative(
+        self,
+        prompt: str,
+        settings: "GenerationSettings",
+        num_draft: int,
+        prompt_cache: Optional["PromptCache"] = None,
+        recorder: Optional[Callable[[str, dict], None]] = None,
+    ) -> Iterator["Token"]:
+        raise NotImplementedError(f"{self.name}: speculative decoding not implemented")
+
     def set_route_callback(self, cb: Callable[[int, list[int], list[float]], None]) -> None:
         raise NotImplementedError(f"{self.name}: routing hooks not implemented")
 
@@ -91,6 +108,8 @@ class MLXBackend(Backend):
         self._tokenizer = None
         self._model_ref: Optional[str] = None
         self._spec: Optional[ModelSpec] = None
+        self._draft_model = None
+        self._draft_ref: Optional[str] = None
 
     def load(self, model_ref: str, spec: Optional[ModelSpec], budget: Budget) -> None:
         try:
@@ -132,9 +151,70 @@ class MLXBackend(Backend):
     def supports_prompt_cache(self) -> bool:
         return True
 
+    def supports_speculative(self) -> bool:
+        return self._model is not None and self._draft_model is not None
+
+    def load_draft(self, draft_ref: str) -> None:
+        try:
+            from mlx_lm import load
+        except ImportError as e:
+            raise RuntimeError("mlx-lm not installed. `pip install -e '.[mlx]'`") from e
+        self._draft_model, _ = load(draft_ref)
+        self._draft_ref = draft_ref
+
+    def generate_speculative(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        num_draft: int,
+        prompt_cache: Optional[PromptCache] = None,
+        recorder: Optional[Callable[[str, dict], None]] = None,
+    ) -> Iterator[Token]:
+        if self._model is None:
+            raise RuntimeError("model not loaded")
+        if self._draft_model is None:
+            raise RuntimeError("draft model not loaded — call load_draft() first")
+        import mlx.core as mx
+        from mlx_lm.sample_utils import make_sampler
+
+        from .spec_decode import speculative_step
+
+        sampler = make_sampler(temp=settings.temperature, top_p=settings.top_p)
+        prompt_ids = mx.array(self._tokenizer.encode(prompt), mx.uint32)
+        detok = self._tokenizer.detokenizer
+        detok.reset()
+        eos_ids = self._tokenizer.eos_token_ids
+
+        gen = speculative_step(
+            prompt_ids,
+            self._model,
+            self._draft_model,
+            num_draft_tokens=num_draft,
+            max_tokens=settings.max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            recorder=recorder,
+        )
+        for token_id, _lp, from_draft in gen:
+            tid = int(token_id)
+            if tid in eos_ids:
+                break
+            detok.add_token(tid)
+            yield Token(
+                text=detok.last_segment,
+                token_id=tid,
+                logprob=None,
+                from_draft=bool(from_draft),
+            )
+        detok.finalize()
+        tail = detok.last_segment
+        if tail:
+            yield Token(text=tail, token_id=-1, logprob=None, from_draft=None)
+
     def unload(self) -> None:
         self._model = None
         self._tokenizer = None
+        self._draft_model = None
 
 
 class LlamaCppBackend(Backend):

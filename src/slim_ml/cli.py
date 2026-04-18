@@ -145,12 +145,104 @@ def bench(
 
 
 @app.command()
+def spec(
+    model: str = typer.Argument(..., help="HF repo id or local path (MLX)"),
+    draft: str = typer.Option(..., help="Draft model for speculation"),
+    prompt: str = typer.Option("Write a Python bubble sort with type hints."),
+    num_draft: int = typer.Option(2, help="Draft tokens per verify round"),
+    max_tokens: int = typer.Option(96),
+    temperature: float = typer.Option(0.0, help="0.0 for greedy (correctness-comparable)"),
+    compare_baseline: bool = typer.Option(
+        True, help="Also run non-speculative baseline and report speedup"
+    ),
+    headroom_gb: float = typer.Option(4.0),
+    log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
+):
+    """Speculative decoding with per-round telemetry.
+
+    MLX-only. Handles hybrid-attention models (Qwen3.5 family) via slim-ml's
+    own snapshot/restore of ArraysCache + KVCache state.
+    """
+    be = MLXBackend()
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    recorder = JsonlRecorder(log) if log else NullRecorder()
+
+    console.print(f"[cyan]loading[/cyan] target={model}  draft={draft}")
+    be.load(model, None, budget)
+    be.load_draft(draft)
+
+    session = Session(backend=be, budget=budget, recorder=recorder)
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+
+    try:
+        if compare_baseline:
+            t0 = time.monotonic()
+            base_tokens: list[int] = []
+            base_text = []
+            for tok in session.generate(prompt, settings):
+                base_tokens.append(tok.token_id)
+                base_text.append(tok.text)
+            t_base = time.monotonic() - t0
+            n_base = len(base_tokens)
+            console.print(
+                f"[bold]baseline[/bold] tokens={n_base} time={t_base:.2f}s "
+                f"tps={n_base / t_base:.1f}"
+            )
+
+        t0 = time.monotonic()
+        spec_tokens: list[int] = []
+        spec_text = []
+        accepted = 0
+        n = 0
+        for tok in session.generate_speculative(
+            prompt, settings, num_draft=num_draft
+        ):
+            spec_tokens.append(tok.token_id)
+            spec_text.append(tok.text)
+            if tok.from_draft:
+                accepted += 1
+            if tok.token_id != -1:
+                n += 1
+        t_spec = time.monotonic() - t0
+        tps = n / t_spec if t_spec > 0 else 0.0
+        accept_rate = (accepted / n) * 100 if n else 0.0
+        console.print(
+            f"[bold]spec[/bold]     tokens={n} time={t_spec:.2f}s "
+            f"tps={tps:.1f}  from_draft={accept_rate:.1f}%"
+        )
+
+        if compare_baseline:
+            speedup = t_base / t_spec if t_spec > 0 else 0.0
+            console.print(f"[green]speedup {speedup:.2f}×[/green]")
+            if temperature == 0.0:
+                m = min(len(base_tokens), len(spec_tokens))
+                diverge = next((i for i in range(m) if base_tokens[i] != spec_tokens[i]), None)
+                if diverge is None and len(base_tokens) == len(spec_tokens):
+                    console.print(f"[green]correctness: {m} tokens identical[/green]")
+                elif diverge is None:
+                    console.print(
+                        f"[yellow]correctness: prefix {m} match, lengths differ "
+                        f"base={len(base_tokens)} spec={len(spec_tokens)}[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"[red]correctness FAIL at idx {diverge}: "
+                        f"base={base_tokens[diverge]} spec={spec_tokens[diverge]}[/red]"
+                    )
+
+        console.print(f"\n[dim]{''.join(spec_text)[:200]}[/dim]")
+    finally:
+        session.close()
+
+
+@app.command()
 def techniques():
     """List registered techniques and their implementation status."""
     table = Table(title="Techniques")
     table.add_column("Name"); table.add_column("Target"); table.add_column("Status")
     table.add_row("expert_cache", "v0", "interface sketched")
-    table.add_row("spec_decode", "v1", "blocked on mlx-lm PR #1111 (hybrid)")
+    table.add_row("spec_decode", "v1", "shipped (MLX, hybrid-attention supported)")
     table.add_row("kv_quant", "v2", "stub")
     table.add_row("layer_stream", "v2", "stub")
     console.print(table)

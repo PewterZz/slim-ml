@@ -144,24 +144,25 @@ class ExpertCache(Technique):
 class SpecDecode(Technique):
     """Speculative decoding: small draft model proposes, big model verifies in parallel.
 
-    STATUS: blocked on upstream mlx-lm PR #1111 for hybrid-attention models.
+    This is NOT a per-step Technique — spec decode replaces the generation loop
+    rather than hooking into it. Use `Session.generate_speculative()` or the
+    `slim-ml spec` CLI command instead of `Session(techniques=[SpecDecode(...)])`.
 
-    On MLX, `mlx_lm.stream_generate(draft_model=..., num_draft_tokens=N)` already
-    wires the generation loop. The missing piece for hybrid-attention families
-    (Qwen3.5, and therefore OmniCoder) is ArraysCache snapshot/restore on
-    draft rejection — see PR ml-explore/mlx-lm#1111. Once merged, pin
-    mlx-lm to that release and this Technique becomes a thin config wrapper.
+    Implementation lives in `slim_ml.spec_decode.speculative_step` — a direct
+    port of `mlx_lm.generate.speculative_generate_step` extended with the
+    ArraysCache snapshot/restore from PR ml-explore/mlx-lm#1111 so hybrid
+    linear+full attention models (Qwen3.5 family, OmniCoder) work correctly.
 
-    Measured ceilings on M3 Air (April 2026, PR #1111 branch, num_draft=2):
+    Measured on M3 Air (April 2026, num_draft=2):
       - Pure KVCache pair (Qwen2.5-Coder-7B + 1.5B-Instruct 4bit): 1.55× @ 62.5% accept
-      - Hybrid pair (OmniCoder 9B 4bit + Qwen3.5-0.8B-MLX-4bit): 1.15× @ 55.2% accept
+      - Hybrid pair (OmniCoder 9B 4bit + Qwen3.5-0.8B-MLX-4bit): ~1.15-1.2× @ 55.2% accept
 
     The hybrid ceiling is lower because 24/32 layers are linear-attention; they
     process sequentially on both verify and post-rejection replay, so only the
     8 full-attention layers benefit from batched verification.
 
-    PR #1111 limitations to surface at attach time:
-      - logits_processors not supported on hybrid models
+    Current implementation limitations (match PR #1111):
+      - logits_processors not wired through
       - KV cache quantization (kv_bits) not supported on hybrid models
     """
     name = "spec_decode"
@@ -172,8 +173,9 @@ class SpecDecode(Technique):
 
     def attach(self, ctx: "RuntimeContext") -> None:
         raise NotImplementedError(
-            "SpecDecode: blocked on mlx-lm PR #1111 for hybrid models. "
-            "See class docstring for measured payoff and integration plan."
+            "SpecDecode is not a per-step Technique. Use "
+            "Session.generate_speculative(...) or the `slim-ml spec` CLI "
+            "command. See class docstring."
         )
 
 
