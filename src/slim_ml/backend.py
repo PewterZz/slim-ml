@@ -83,6 +83,12 @@ class Backend(ABC):
     def load_draft(self, draft_ref: str) -> None:
         raise NotImplementedError(f"{self.name}: draft model loading not implemented")
 
+    def set_route_callback(
+        self,
+        cb: Optional[Callable[[int, list[int], Optional[list[float]]], None]],
+    ) -> int:
+        raise NotImplementedError(f"{self.name}: routing hooks not implemented")
+
     def generate_speculative(
         self,
         prompt: str,
@@ -93,14 +99,46 @@ class Backend(ABC):
     ) -> Iterator["Token"]:
         raise NotImplementedError(f"{self.name}: speculative decoding not implemented")
 
-    def set_route_callback(self, cb: Callable[[int, list[int], list[float]], None]) -> None:
-        raise NotImplementedError(f"{self.name}: routing hooks not implemented")
-
     def migrate_expert(self, layer_idx: int, expert_id: int, to_tier: Tier) -> None:
         raise NotImplementedError(f"{self.name}: expert migration not implemented")
 
     def expert_placement(self, layer_idx: int, expert_id: int) -> Tier:
         raise NotImplementedError(f"{self.name}: placement introspection not implemented")
+
+
+# Route observation scaffold (Stage 0 of expert caching).
+# We patch MLX's SwitchGLU/SwitchMLP __call__ at class level on first use and
+# route observations only for instances that have registered a callback via
+# _ROUTE_STATE[id(instance)]. Classes with no observed instances see two
+# getattr-equivalent dict misses per forward — negligible on the MoE critical
+# path. `indices.reshape(-1).tolist()` forces a device sync, so this is
+# deliberately a profiling hook, not something to leave wired in hot-path.
+_ROUTE_ORIG_CALLS: dict[type, Any] = {}
+_ROUTE_STATE: dict[int, tuple[int, Callable[..., None]]] = {}
+_ROUTE_CB_WARNED: set[int] = set()
+
+
+def _patch_switch_class_once(cls: type) -> None:
+    if cls in _ROUTE_ORIG_CALLS:
+        return
+    orig = cls.__call__
+    _ROUTE_ORIG_CALLS[cls] = orig
+
+    def patched(self, x, indices):
+        st = _ROUTE_STATE.get(id(self))
+        if st is not None:
+            layer_idx, cb = st
+            try:
+                flat = indices.reshape(-1).tolist()
+                cb(layer_idx, flat, None)
+            except Exception:
+                if id(cb) not in _ROUTE_CB_WARNED:
+                    _ROUTE_CB_WARNED.add(id(cb))
+                    import traceback
+                    traceback.print_exc()
+        return _ROUTE_ORIG_CALLS[type(self)](self, x, indices)
+
+    cls.__call__ = patched  # type: ignore[method-assign]
 
 
 class MLXBackend(Backend):
@@ -113,6 +151,7 @@ class MLXBackend(Backend):
         self._spec: Optional[ModelSpec] = None
         self._draft_model = None
         self._draft_ref: Optional[str] = None
+        self._route_instance_ids: list[int] = []
 
     def load(self, model_ref: str, spec: Optional[ModelSpec], budget: Budget) -> None:
         try:
@@ -160,6 +199,41 @@ class MLXBackend(Backend):
 
     def supports_speculative(self) -> bool:
         return self._model is not None and self._draft_model is not None
+
+    def _iter_moe_switch_layers(self):
+        if self._model is None:
+            return
+        inner = getattr(self._model, "model", None)
+        layers = getattr(inner, "layers", None) if inner is not None else None
+        if not layers:
+            return
+        for idx, layer in enumerate(layers):
+            mlp = getattr(layer, "mlp", None)
+            switch = getattr(mlp, "switch_mlp", None) if mlp is not None else None
+            if switch is not None:
+                yield idx, switch
+
+    def supports_routing_hooks(self) -> bool:
+        return any(True for _ in self._iter_moe_switch_layers())
+
+    def set_route_callback(
+        self,
+        cb: Optional[Callable[[int, list[int], Optional[list[float]]], None]],
+    ) -> int:
+        if self._model is None:
+            raise RuntimeError("model not loaded")
+        for iid in self._route_instance_ids:
+            _ROUTE_STATE.pop(iid, None)
+        self._route_instance_ids = []
+        n = 0
+        for layer_idx, switch in self._iter_moe_switch_layers():
+            if cb is None:
+                continue
+            _patch_switch_class_once(type(switch))
+            _ROUTE_STATE[id(switch)] = (layer_idx, cb)
+            self._route_instance_ids.append(id(switch))
+            n += 1
+        return n
 
     def load_draft(self, draft_ref: str) -> None:
         try:
@@ -219,6 +293,9 @@ class MLXBackend(Backend):
             yield Token(text=tail, token_id=-1, logprob=None, from_draft=None)
 
     def unload(self) -> None:
+        for iid in self._route_instance_ids:
+            _ROUTE_STATE.pop(iid, None)
+        self._route_instance_ids = []
         self._model = None
         self._tokenizer = None
         self._draft_model = None

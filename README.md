@@ -23,8 +23,8 @@ Early scaffold. What works end-to-end today:
 - `slim-ml spec MODEL --draft DRAFT` — speculative decoding with correctness gate and per-round telemetry
 
 What's interface-only (NotImplementedError):
-- Expert caching (primary v0 technique)
-- KV quantization, layer streaming
+- Expert caching migration (hot-set selection + tier moves; observation hook below is shipped)
+- KV quantization Technique (runtime knob shipped as `--kv-bits`), layer streaming
 
 ## Speculative decoding
 
@@ -108,6 +108,43 @@ only 8/32 layers have a quantizable KV cache, and at 256-token context the
 peak is dominated by model weights, not KV. Expected win cases: pure-KV
 models (Qwen2.5-Coder), long context (>4k tokens), or tight-memory regimes
 where trading tps for headroom unblocks a bigger model.
+
+## Expert caching (Stage 0: observation)
+
+Expert-cache migration is the primary v0 technique — for MoE models where
+only ~5% of parameters are active per token, placing hot experts in fast
+memory and cold experts in slow memory can unlock models that don't fit in
+VRAM. Before committing to the migration design, Stage 0 just profiles
+routing to verify the premise is true on the target model.
+
+`MLXBackend.set_route_callback(cb)` patches MLX's `SwitchGLU`/`SwitchMLP`
+to emit `(layer_idx, expert_ids, weights)` into `cb` on each MoE forward.
+The patch is a class-level monkey-patch with a per-instance sentinel, so
+unrelated models loaded in the same process are unaffected. There's a
+device-sync cost (`indices.tolist()`) — this is a profiling hook, not a
+production hot-path.
+
+Run the profiler on any MoE model:
+
+```bash
+python tools/routing_observe.py \
+  --model mlx-community/OLMoE-1B-7B-0125-Instruct-4bit \
+  --max-tokens 128
+```
+
+Reports total routing events and global top-{5,10,20,50}% expert capture.
+If routing is Zipfian, top-10% should capture >30% of routes — the
+threshold we'd need for migration to pay off on a laptop-tier model.
+
+**What's not shipped yet:** the `ExpertCache` technique still raises on
+`attach()` for migration. Per-expert weight relocation in MLX is non-trivial
+— `SwitchLinear` packs all N experts into one `(num_experts, out, in)`
+tensor accessed via `mx.gather_mm`, so "move expert 47 to VRAM" is tensor
+surgery, not a pointer swap. And on M3-class unified memory there's no
+VRAM/RAM bandwidth gap to exploit anyway — tiered placement is a
+gaming-laptop-with-dGPU payoff, not an Apple Silicon one. The observation
+scaffold exists on both; migration is gated on a target with the memory
+topology to make it worthwhile.
 
 ## Install
 
