@@ -144,17 +144,37 @@ class ExpertCache(Technique):
 class SpecDecode(Technique):
     """Speculative decoding: small draft model proposes, big model verifies in parallel.
 
-    Requires backend to support: batched forward with accepted-prefix reuse, and
-    ability to run two models sharing tokenizer. See docs/plans/spec_decode.md (TODO).
+    STATUS: blocked on upstream mlx-lm PR #1111 for hybrid-attention models.
+
+    On MLX, `mlx_lm.stream_generate(draft_model=..., num_draft_tokens=N)` already
+    wires the generation loop. The missing piece for hybrid-attention families
+    (Qwen3.5, and therefore OmniCoder) is ArraysCache snapshot/restore on
+    draft rejection — see PR ml-explore/mlx-lm#1111. Once merged, pin
+    mlx-lm to that release and this Technique becomes a thin config wrapper.
+
+    Measured ceilings on M3 Air (April 2026, PR #1111 branch, num_draft=2):
+      - Pure KVCache pair (Qwen2.5-Coder-7B + 1.5B-Instruct 4bit): 1.55× @ 62.5% accept
+      - Hybrid pair (OmniCoder 9B 4bit + Qwen3.5-0.8B-MLX-4bit): 1.15× @ 55.2% accept
+
+    The hybrid ceiling is lower because 24/32 layers are linear-attention; they
+    process sequentially on both verify and post-rejection replay, so only the
+    8 full-attention layers benefit from batched verification.
+
+    PR #1111 limitations to surface at attach time:
+      - logits_processors not supported on hybrid models
+      - KV cache quantization (kv_bits) not supported on hybrid models
     """
     name = "spec_decode"
 
-    def __init__(self, draft_model: str, gamma: int = 4):
+    def __init__(self, draft_model: str, num_draft_tokens: int = 2):
         self.draft_model = draft_model
-        self.gamma = gamma
+        self.num_draft_tokens = num_draft_tokens
 
     def attach(self, ctx: "RuntimeContext") -> None:
-        raise NotImplementedError("SpecDecode: v1 target, not yet implemented")
+        raise NotImplementedError(
+            "SpecDecode: blocked on mlx-lm PR #1111 for hybrid models. "
+            "See class docstring for measured payoff and integration plan."
+        )
 
 
 class KVQuant(Technique):

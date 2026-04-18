@@ -150,7 +150,7 @@ def techniques():
     table = Table(title="Techniques")
     table.add_column("Name"); table.add_column("Target"); table.add_column("Status")
     table.add_row("expert_cache", "v0", "interface sketched")
-    table.add_row("spec_decode", "v1", "stub")
+    table.add_row("spec_decode", "v1", "blocked on mlx-lm PR #1111 (hybrid)")
     table.add_row("kv_quant", "v2", "stub")
     table.add_row("layer_stream", "v2", "stub")
     console.print(table)
