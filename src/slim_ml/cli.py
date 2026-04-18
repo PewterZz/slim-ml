@@ -409,6 +409,107 @@ def pld(
 
 
 @app.command()
+def hybrid(
+    model: str = typer.Argument(..., help="Target model (MLX)"),
+    draft: str = typer.Option(..., help="Draft model for fallback when PLD has no match"),
+    prompt: str = typer.Option(
+        "Write a Python function that takes a list of integers and returns "
+        "the median. Handle even-length lists by averaging the two middle "
+        "elements. Include a docstring and type hints."
+    ),
+    num_draft: int = typer.Option(4, help="Max draft tokens per verify round"),
+    max_ngram: int = typer.Option(3, help="Max n-gram size for PLD lookup"),
+    min_ngram: int = typer.Option(2, help="Min n-gram size for PLD lookup"),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0, help="0.0 enables correctness gate vs baseline"),
+    compare_baseline: bool = typer.Option(
+        True, help="Also run non-speculative baseline and report speedup"
+    ),
+    headroom_gb: float = typer.Option(4.0),
+    log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
+):
+    """Hybrid speculative: PLD n-gram lookup first, draft model on no match.
+
+    Fills the bottleneck PLD alone leaves (rounds with no n-gram match degrade
+    to plain single-token steps). Uses the same verifier as `spec` and `pld`
+    so correctness behaves identically at temp=0.
+    """
+    be = MLXBackend()
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    recorder = JsonlRecorder(log) if log else NullRecorder()
+
+    console.print(f"[cyan]loading[/cyan] target={model}  draft={draft}")
+    be.load(model, None, budget)
+    be.load_draft(draft)
+
+    session = Session(backend=be, budget=budget, recorder=recorder)
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+
+    try:
+        if compare_baseline:
+            t0 = time.monotonic()
+            base_tokens: list[int] = []
+            for tok in session.generate(prompt, settings):
+                base_tokens.append(tok.token_id)
+            t_base = time.monotonic() - t0
+            n_base = len(base_tokens)
+            console.print(
+                f"[bold]baseline[/bold] tokens={n_base} time={t_base:.2f}s "
+                f"tps={n_base / t_base:.1f}"
+            )
+
+        t0 = time.monotonic()
+        hyb_tokens: list[int] = []
+        hyb_text: list[str] = []
+        accepted = 0
+        n = 0
+        for tok in session.generate_hybrid_speculative(
+            prompt,
+            settings,
+            num_draft=num_draft,
+            max_ngram_size=max_ngram,
+            min_ngram_size=min_ngram,
+        ):
+            if tok.token_id != -1:
+                hyb_tokens.append(tok.token_id)
+                n += 1
+            hyb_text.append(tok.text)
+            if tok.from_draft:
+                accepted += 1
+        t_hyb = time.monotonic() - t0
+        tps = n / t_hyb if t_hyb > 0 else 0.0
+        accept_rate = (accepted / n) * 100 if n else 0.0
+        console.print(
+            f"[bold]hybrid[/bold]   tokens={n} time={t_hyb:.2f}s "
+            f"tps={tps:.1f}  from_draft={accept_rate:.1f}%"
+        )
+
+        if compare_baseline:
+            speedup = t_base / t_hyb if t_hyb > 0 else 0.0
+            console.print(f"[green]speedup {speedup:.2f}×[/green]")
+            if temperature == 0.0:
+                m = min(len(base_tokens), len(hyb_tokens))
+                diverge = next((i for i in range(m) if base_tokens[i] != hyb_tokens[i]), None)
+                if diverge is None and len(base_tokens) == len(hyb_tokens):
+                    console.print(f"[green]correctness: {m} tokens identical[/green]")
+                elif diverge is None:
+                    console.print(
+                        f"[yellow]correctness: prefix {m} match, lengths differ "
+                        f"base={len(base_tokens)} hybrid={len(hyb_tokens)}[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"[red]correctness FAIL at idx {diverge}: "
+                        f"base={base_tokens[diverge]} hybrid={hyb_tokens[diverge]}[/red]"
+                    )
+
+        console.print(f"\n[dim]{''.join(hyb_text)[:200]}[/dim]")
+    finally:
+        session.close()
+
+
+@app.command()
 def techniques():
     """List registered techniques and their implementation status."""
     table = Table(title="Techniques")

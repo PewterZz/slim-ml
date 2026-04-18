@@ -12,6 +12,11 @@ replay_ms}`, and generation_end includes aggregate acceptance + mean accept/roun
 `speculative_step_pld` is the same verifier with a prompt-lookup draft: drafts
 come from an n-gram match against what we've already produced, not a draft
 model. Cheap win on workloads with context-local repetition (code, refactors).
+
+`speculative_step_hybrid` combines both: PLD n-gram lookup first, fall back to
+the draft model on rounds with no match. Same verifier path. Keeps draft_cache
+in sync lazily — it only catches up to history[:-1] right before the draft
+model is invoked, so streaks of PLD-only rounds don't pay draft-model cost.
 """
 from __future__ import annotations
 
@@ -369,3 +374,226 @@ def speculative_step_pld(
             y = mx.array([tokens_list[n_accept]], mx.uint32)
     finally:
         _rewind(num_draft, n_accept)
+
+
+def speculative_step_hybrid(
+    prompt: mx.array,
+    model,
+    draft_model,
+    num_draft_tokens: int = 4,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    prompt_cache: Optional[List[Any]] = None,
+    prefill_step_size: int = 512,
+    max_ngram_size: int = 3,
+    min_ngram_size: int = 2,
+    recorder: Optional[Callable[[str, dict], None]] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """PLD first, draft-model fallback. Same verifier as the other two.
+
+    Cache bookkeeping: model_cache advances every round via the verifier.
+    draft_cache advances only on draft-model rounds. On PLD rounds we record
+    the emitted tokens in `draft_cache_behind` and flush them into draft_cache
+    the next time the draft model is invoked. If PLD keeps hitting, the flush
+    never happens and we never pay for the draft model.
+    """
+    y = prompt.astype(mx.uint32)
+    history: list[int] = y.tolist()
+
+    if prompt_cache is None:
+        model_cache = make_prompt_cache(model)
+        draft_cache = make_prompt_cache(draft_model)
+    else:
+        model_cache = prompt_cache[: len(model.layers)]
+        draft_cache = prompt_cache[len(model.layers):]
+
+    has_arrays = any(isinstance(c, ArraysCache) for c in model_cache)
+    if not has_arrays and not can_trim_prompt_cache(model_cache):
+        bad = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Non-hybrid prompt cache is not trimmable: {bad}. "
+            "slim-ml hybrid handles ArraysCache but not arbitrary non-trimmable caches."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    def _sample(logits):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    def _step(m, c, tokens, n_predict=1):
+        with mx.stream(_STREAM):
+            logits = m(tokens[None], cache=c)[:, -n_predict:, :]
+            if n_predict == 1:
+                return _sample(logits.squeeze(0))
+            outs, lps = [], []
+            for i in range(n_predict):
+                tok, lp = _sample(logits[:, i, :])
+                outs.append(tok)
+                lps.append(lp)
+            return mx.concatenate(outs, axis=0), mx.concatenate(lps, axis=0)
+
+    def _prefill(m, c, tokens):
+        while tokens.size > 1:
+            n = min(prefill_step_size, tokens.size - 1)
+            m(tokens[:n][None], cache=c)
+            mx.eval([ch.state for ch in c])
+            tokens = tokens[n:]
+            mx.clear_cache()
+        return tokens
+
+    def _draft_generate(tok, n_draft):
+        if n_draft == 0:
+            return mx.array([], mx.uint32)
+        out = []
+        for _ in range(n_draft):
+            tok, _ = _step(draft_model, draft_cache, tok)
+            mx.async_eval(tok)
+            out.append(tok)
+        return mx.concatenate(out)
+
+    draft_cache_behind: list[int] = []
+
+    def _catch_up_draft_cache():
+        if not draft_cache_behind:
+            return
+        pending = mx.array(draft_cache_behind, mx.uint32)
+        with mx.stream(_STREAM):
+            draft_model(pending[None], cache=draft_cache)
+            mx.eval([c.state for c in draft_cache])
+        draft_cache_behind.clear()
+
+    hybrid_snap: dict = {"arrays": {}, "kv_offsets": {}, "verify_input": None}
+
+    def _snapshot(verify_input: mx.array) -> None:
+        hybrid_snap["verify_input"] = verify_input
+        hybrid_snap["arrays"] = {
+            i: list(c.cache) for i, c in enumerate(model_cache) if isinstance(c, ArraysCache)
+        }
+        hybrid_snap["kv_offsets"] = {
+            i: c.offset for i, c in enumerate(model_cache) if isinstance(c, KVCache)
+        }
+
+    def _rewind_model(n_draft: int, n_accept: int) -> float:
+        trim_prompt_cache(model_cache, n_draft - n_accept)
+        if not (has_arrays and n_draft > n_accept):
+            return 0.0
+        t0 = time.monotonic()
+        saved_arrays = hybrid_snap["arrays"]
+        saved_kv_offsets = hybrid_snap["kv_offsets"]
+        verify_input = hybrid_snap["verify_input"]
+        if not saved_arrays or verify_input is None:
+            return 0.0
+        for i, c in enumerate(model_cache):
+            if isinstance(c, KVCache) and i in saved_kv_offsets:
+                c.offset = saved_kv_offsets[i]
+            if isinstance(c, ArraysCache) and i in saved_arrays:
+                c.cache = list(saved_arrays[i])
+        rejected = n_draft - n_accept
+        accepted = verify_input[:-rejected]
+        with mx.stream(_STREAM):
+            model(accepted[None], cache=model_cache)
+            mx.eval([c.state for c in model_cache if isinstance(c, ArraysCache)])
+        return (time.monotonic() - t0) * 1000.0
+
+    with mx.stream(_STREAM):
+        _ = _prefill(draft_model, draft_cache, y)
+        y = _prefill(model, model_cache, y)
+
+    ntoks = 0
+    num_draft = 0
+    n_accept = 0
+    round_idx = 0
+    try:
+        while True:
+            remaining = max_tokens - ntoks
+            budget = min(remaining, num_draft_tokens)
+
+            pld_draft = prompt_lookup_draft(
+                history, budget, max_ngram_size=max_ngram_size, min_ngram_size=min_ngram_size
+            )
+            used_pld = len(pld_draft) > 0
+            draft_model_ran = False
+            old_anchor_int = history[-1]
+
+            if used_pld:
+                draft_list = pld_draft
+                draft_tokens = mx.array(draft_list, mx.uint32)
+            elif budget > 0:
+                _catch_up_draft_cache()
+                draft_tokens = _draft_generate(y, budget)
+                draft_list = draft_tokens.tolist()
+                draft_model_ran = True
+            else:
+                draft_tokens = mx.array([], mx.uint32)
+                draft_list = []
+
+            num_draft = len(draft_list)
+
+            if num_draft > 0:
+                y_verify = mx.concatenate([y, draft_tokens])
+                if has_arrays:
+                    _snapshot(y_verify)
+            else:
+                y_verify = y
+
+            t_verify = time.monotonic()
+            tokens, logprobs = _step(model, model_cache, y_verify, num_draft + 1)
+            if num_draft > 0:
+                mx.eval(tokens, draft_tokens)
+            else:
+                mx.eval(tokens)
+            verify_ms = (time.monotonic() - t_verify) * 1000.0
+
+            tokens_list = tokens.tolist()
+
+            n_accept = 0
+            while n_accept < num_draft:
+                if tokens_list[n_accept] != draft_list[n_accept]:
+                    break
+                tn = tokens_list[n_accept]
+                lpn = logprobs[n_accept]
+                n_accept += 1
+                ntoks += 1
+                history.append(tn)
+                yield tn, lpn, True
+                if ntoks == max_tokens:
+                    break
+
+            if ntoks < max_tokens:
+                fresh = tokens_list[n_accept]
+                ntoks += 1
+                history.append(fresh)
+                yield fresh, logprobs[n_accept], False
+
+            replay_ms = _rewind_model(num_draft, n_accept)
+            if draft_model_ran:
+                trim_prompt_cache(draft_cache, max(num_draft - n_accept - 1, 0))
+                if n_accept == num_draft and num_draft > 0:
+                    draft_cache_behind.append(draft_list[-1])
+            else:
+                draft_cache_behind.append(old_anchor_int)
+                for i in range(n_accept):
+                    draft_cache_behind.append(draft_list[i])
+
+            if recorder is not None:
+                source = "pld" if used_pld else ("draft_model" if draft_model_ran else "none")
+                recorder(
+                    "hybrid_round",
+                    {
+                        "round": round_idx,
+                        "num_draft": num_draft,
+                        "num_accept": n_accept,
+                        "verify_ms": verify_ms,
+                        "replay_ms": replay_ms,
+                        "source": source,
+                    },
+                )
+            round_idx += 1
+
+            if ntoks >= max_tokens:
+                break
+
+            y = mx.array([tokens_list[n_accept]], mx.uint32)
+    finally:
+        _rewind_model(num_draft, n_accept)

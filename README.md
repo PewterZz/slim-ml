@@ -22,6 +22,7 @@ Early scaffold. What works end-to-end today:
 - `slim-ml bench MODEL` — prompt cache reuse benchmark (~6.4× TTFT on turn 2)
 - `slim-ml spec MODEL --draft DRAFT` — speculative decoding with correctness gate and per-round telemetry
 - `slim-ml pld MODEL` — draftless Prompt Lookup Decoding (n-gram match against context) with correctness gate
+- `slim-ml hybrid MODEL --draft DRAFT` — PLD first, draft model on no-match fallback (investigated; see results below)
 
 What's interface-only (NotImplementedError):
 - Expert caching migration (hot-set selection + tier moves; observation hook below is shipped)
@@ -125,6 +126,51 @@ ceiling, not what generate-from-scratch on a laptop will hit.
 The implementation (`src/slim_ml/prompt_lookup.py` + `speculative_step_pld`
 in `spec_decode.py`) shares the same snapshot/restore machinery as the
 draft-model path, so it works on hybrid-attention models too.
+
+## Hybrid PLD + draft-model (investigated, negative on unified memory)
+
+Hypothesis: PLD telemetry showed 72% of rounds (63/87) found no n-gram
+match and degraded to a plain step. Stacking PLD first, falling back to
+a draft model on no-match, should fill that bottleneck using the same
+verifier — expected aggregate 1.5-1.8×.
+
+```bash
+slim-ml hybrid mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --draft mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit \
+  --num-draft 8 --max-tokens 192 --temperature 0.0
+```
+
+Measured on M3 Air 16GB (April 2026, Qwen2.5-Coder-7B 4bit target +
+1.5B 4bit draft, temp=0, 192 tokens, num_draft=8, back-to-back baseline
+vs hybrid in a single command):
+
+| workload | baseline | hybrid | speedup | correctness |
+|---|---|---|---|---|
+| dataclass (open gen) | 19.1 tps | 19.3 tps | 1.01× | 192/192 identical |
+| rename refactor | 13.4 tps | 10.0 tps | 0.74× | 165/165 prefix match, hybrid stops 1 token before baseline's `<|endoftext|>` (same EOS-boundary behavior as `spec` alone) |
+
+Compare against PLD-alone on the same workload: **1.38×** on dataclass
+and 1.01× on rename. Hybrid is **neutral-to-negative vs PLD alone** on
+MLX unified memory.
+
+Per-round telemetry on the dataclass run: 36 rounds total (vs PLD-alone's
+87), of which 25 were draft-model fallback at 75% accept rate. Each
+draft-model round costs ~190ms verify + ~55ms draft gen = ~245ms for
+~6 accepted tokens. PLD-alone's cheap "plain step" fallback at ~50ms
+beats that on unified memory, where the draft model has no bandwidth
+advantage over the target. Draft-model speculation amortizes when draft
+forward passes are ~10× cheaper than target passes (dGPU with VRAM/RAM
+gap); on M3 unified memory they're the same speed, so the draft work
+is mostly overhead.
+
+Hybrid's correctness holds (gate passes on both runs). The 165/166 rename
+length difference matches `spec`-alone's EOS-boundary behavior — both
+stop one token before baseline emits `<|endoftext|>`. Content prefix is
+identical.
+
+Shipped as an opt-in CLI command to keep the negative result
+reproducible. Do not reach for it; reach for `pld` (no draft model) or
+`spec` (with draft, copy-from-prompt workloads excluded).
 
 ## KV cache quantization
 
