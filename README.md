@@ -136,6 +136,23 @@ Reports total routing events and global top-{5,10,20,50}% expert capture.
 If routing is Zipfian, top-10% should capture >30% of routes — the
 threshold we'd need for migration to pay off on a laptop-tier model.
 
+Measured on OLMoE-1B-7B-0125-Instruct-4bit (16 MoE layers × 64 experts,
+128-token multi-topic prompt, April 2026):
+
+| top-k% experts | routes captured |
+|---|---|
+| 5% | 16.4% |
+| 10% | 26.2% |
+| 20% | 41.9% |
+| 50% | 75.8% |
+
+Skew is real (top-10% = 2.6× uniform) but below the 30% threshold.
+Per-layer top-10% ranges 17–35%, so migration might still pay off on the
+deeper layers (layer 14 alone hits 35%). This is the whole point of Stage 0
+— quantify the premise before building the migration. Next step is to
+repeat on a longer, code-heavy sample (where routing may concentrate
+more) and on Qwen3-MoE before committing to migration.
+
 **What's not shipped yet:** the `ExpertCache` technique still raises on
 `attach()` for migration. Per-expert weight relocation in MLX is non-trivial
 — `SwitchLinear` packs all N experts into one `(num_experts, out, in)`
