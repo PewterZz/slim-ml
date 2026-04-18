@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from typing import Optional
 
 import typer
@@ -62,6 +63,83 @@ def run(
         for tok in session.generate(prompt, settings):
             console.print(tok.text, end="")
         console.print()
+    finally:
+        session.close()
+
+
+@app.command()
+def bench(
+    model: str = typer.Argument(..., help="HF repo id, local path, or GGUF file"),
+    backend: str = typer.Option("auto", help="mlx | llama_cpp | auto"),
+    system_prompt: str = typer.Option(
+        "You are an expert Python programmer. Respond only with idiomatic, well-typed code. "
+        * 20,
+        help="Long shared prefix. Dominates prefill time.",
+    ),
+    user_a: str = typer.Option("Write a bubble sort.", help="First user turn"),
+    user_b: str = typer.Option("Write a merge sort.", help="Second user turn"),
+    max_tokens: int = typer.Option(40),
+    temperature: float = typer.Option(0.7),
+    headroom_gb: float = typer.Option(4.0),
+    log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
+):
+    """
+    Benchmark prompt-cache reuse.
+
+    Runs the SAME conversation twice:
+    - Cold: fresh cache, full prompt prefilled every turn.
+    - Warm: shared cache, turn 2 submits only the new user tokens.
+
+    Reports TTFT delta — how much prefill you save on turn 2 by keeping state.
+    """
+    if backend == "auto":
+        backend = "mlx" if sys.platform == "darwin" else "llama_cpp"
+    be = MLXBackend() if backend == "mlx" else LlamaCppBackend()
+
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    recorder = JsonlRecorder(log) if log else NullRecorder()
+
+    console.print(f"[cyan]loading[/cyan] {model} via {backend}")
+    be.load(model, None, budget)
+    session = Session(backend=be, budget=budget, recorder=recorder)
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+
+    def turn(label: str, prompt: str, cache):
+        t0 = time.monotonic()
+        ttft = None
+        out_parts = []
+        count = 0
+        for tok in session.generate(prompt, settings, cache=cache):
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            out_parts.append(tok.text)
+            count += 1
+        elapsed = time.monotonic() - t0
+        decode_tps = (count - 1) / (elapsed - ttft) if count > 1 and ttft else 0.0
+        out = "".join(out_parts)
+        console.print(f"[bold cyan]{label}[/bold cyan] ttft={ttft*1000:.0f}ms  total={elapsed:.2f}s  decode={decode_tps:.1f} t/s  tokens={count}")
+        console.print(f"  [dim]{out[:120]}...[/dim]" if len(out) > 120 else f"  [dim]{out}[/dim]")
+        return ttft or 0.0, out
+
+    try:
+        # --- Cold path: no cache reuse, each turn sends full prompt ---
+        console.print("\n[bold]Cold (no cache reuse)[/bold]")
+        ttft_c1, out_c1 = turn("t1 (full prompt)  ", system_prompt + "\nUser: " + user_a + "\nAssistant:", None)
+        ttft_c2, _ = turn("t2 (full prompt)  ", system_prompt + "\nUser: " + user_a + "\nAssistant: " + out_c1 + "\nUser: " + user_b + "\nAssistant:", None)
+
+        # --- Warm path: shared cache, t2 submits only the new tokens ---
+        console.print("\n[bold]Warm (shared cache)[/bold]")
+        cache = session.new_cache()
+        if cache is None:
+            console.print("[yellow]backend does not support prompt cache — skipping warm path[/yellow]")
+            return
+        ttft_w1, _ = turn("t1 (full prompt)  ", system_prompt + "\nUser: " + user_a + "\nAssistant:", cache)
+        # Generated tokens from t1 are already in the cache. t2 submits only new user turn.
+        ttft_w2, _ = turn("t2 (delta only)   ", "\nUser: " + user_b + "\nAssistant:", cache)
+
+        console.print()
+        console.print(f"[green]T2 TTFT  cold={ttft_c2*1000:.0f}ms  warm={ttft_w2*1000:.0f}ms  savings={(ttft_c2-ttft_w2)*1000:.0f}ms  speedup={(ttft_c2/ttft_w2 if ttft_w2 else float('inf')):.1f}×[/green]")
     finally:
         session.close()
 

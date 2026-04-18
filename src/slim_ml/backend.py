@@ -35,6 +35,9 @@ class Token:
     logprob: Optional[float] = None
 
 
+PromptCache = Any
+
+
 class Backend(ABC):
     name: str
 
@@ -42,10 +45,21 @@ class Backend(ABC):
     def load(self, model_ref: str, spec: Optional[ModelSpec], budget: Budget) -> None: ...
 
     @abstractmethod
-    def generate(self, prompt: str, settings: GenerationSettings) -> Iterator[Token]: ...
+    def generate(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        prompt_cache: Optional[PromptCache] = None,
+    ) -> Iterator[Token]: ...
 
     @abstractmethod
     def unload(self) -> None: ...
+
+    def make_prompt_cache(self) -> Optional[PromptCache]:
+        return None
+
+    def supports_prompt_cache(self) -> bool:
+        return False
 
     def supports_routing_hooks(self) -> bool:
         return False
@@ -87,21 +101,36 @@ class MLXBackend(Backend):
         self._model_ref = model_ref
         self._spec = spec
 
-    def generate(self, prompt: str, settings: GenerationSettings) -> Iterator[Token]:
+    def generate(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        prompt_cache: Optional[PromptCache] = None,
+    ) -> Iterator[Token]:
         if self._model is None:
             raise RuntimeError("model not loaded")
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
 
         sampler = make_sampler(temp=settings.temperature, top_p=settings.top_p)
-        for resp in stream_generate(
-            self._model,
-            self._tokenizer,
+        kwargs: dict[str, Any] = dict(
             prompt=prompt,
             max_tokens=settings.max_tokens,
             sampler=sampler,
-        ):
+        )
+        if prompt_cache is not None:
+            kwargs["prompt_cache"] = prompt_cache
+        for resp in stream_generate(self._model, self._tokenizer, **kwargs):
             yield Token(text=resp.text, token_id=resp.token, logprob=None)
+
+    def make_prompt_cache(self) -> Optional[PromptCache]:
+        if self._model is None:
+            raise RuntimeError("model not loaded")
+        from mlx_lm.models.cache import make_prompt_cache
+        return make_prompt_cache(self._model)
+
+    def supports_prompt_cache(self) -> bool:
+        return True
 
     def unload(self) -> None:
         self._model = None
@@ -125,9 +154,19 @@ class LlamaCppBackend(Backend):
         self._llm = Llama(model_path=model_ref, n_gpu_layers=n_gpu_layers, n_ctx=4096, verbose=False)
         self._spec = spec
 
-    def generate(self, prompt: str, settings: GenerationSettings) -> Iterator[Token]:
+    def generate(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        prompt_cache: Optional[PromptCache] = None,
+    ) -> Iterator[Token]:
         if self._llm is None:
             raise RuntimeError("model not loaded")
+        if prompt_cache is not None:
+            raise NotImplementedError(
+                "llama_cpp: prompt cache reuse not wired — use llama.cpp's own "
+                "state save/load via ctypes or handle at a higher layer"
+            )
         stream = self._llm(
             prompt,
             max_tokens=settings.max_tokens,
