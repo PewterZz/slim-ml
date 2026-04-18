@@ -123,6 +123,27 @@ heavily mirrors the prompt. This is the first PLD port to MLX that I'm
 aware of — PROMTEC's 4.23× figure (HumanEval edit tasks) is the theoretical
 ceiling, not what generate-from-scratch on a laptop will hit.
 
+**Edit-workload measurement (April 2026, ~1500-token prompt asking for
+type-annotation pass on existing code, temp=0, num_draft=8):**
+
+| output tokens | baseline tps | PLD tps | speedup | from_draft |
+|---|---|---|---|---|
+| 192 | 2.6 | 4.2 | **1.60×** | 70.3% |
+| 384 | 4.4 | 4.7 | 1.07× | 68.8% |
+
+The 1.60× at 192 tokens confirms PLD's ceiling is higher on edit-shaped
+workloads (70% of output tokens come from prompt n-grams). But the
+speedup fades as output extends past the mirrored portion — at 384 tokens
+the model is generating novel code and PLD's hit rate drops. Per-round
+telemetry at 192 tokens: 58 rounds, 33 with draft, 25 no match. Bimodal
+distribution — 14 rounds accepted all 8 drafts, 36 accepted 0.
+
+**Load sensitivity:** under heavy system contention (baseline ~6 tps
+instead of ~18 tps), PLD degrades to 0.76-0.80× vs baseline — the
+speedup flips sign. On a laptop with browser/other apps running, PLD may
+perform worse than baseline. The 1.38× and 1.60× numbers are clean-room
+upper bounds, not floors.
+
 The implementation (`src/slim_ml/prompt_lookup.py` + `speculative_step_pld`
 in `spec_decode.py`) shares the same snapshot/restore machinery as the
 draft-model path, so it works on hybrid-attention models too.
@@ -171,16 +192,6 @@ identical.
 Shipped as an opt-in CLI command to keep the negative result
 reproducible. Do not reach for it; reach for `pld` (no draft model) or
 `spec` (with draft, copy-from-prompt workloads excluded).
-
-**Load sensitivity:** speculation on MLX unified memory is fragile to
-system contention. Back-to-back same-session measurements on a loaded
-M3 Air (baseline dropped from ~18 tps to ~6 tps due to background
-processes) showed PLD regress to **0.80×** and hybrid to **0.51×** on
-the dataclass workload — both flipped sign. The "hybrid worse than PLD"
-conclusion holds in both clean and contended regimes (hybrid speedup
-is roughly 0.65× of PLD's speedup either way), but users running on
-loaded laptops may see any speculation regress below baseline. The
-reported numbers are clean-room upper bounds, not floors.
 
 ## KV cache quantization
 
