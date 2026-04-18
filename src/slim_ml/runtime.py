@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
-from .backend import Backend, GenerationSettings, Token
+from .backend import Backend, GenerationSettings, PromptCache, Token
 from .budget import Budget
 from .model import ModelSpec
 from .technique import StepState, Technique
@@ -38,13 +39,33 @@ class Session:
         for t in self.ctx.techniques:
             t.attach(self.ctx)
 
-    def generate(self, prompt: str, settings: GenerationSettings) -> Iterator[Token]:
+    def new_cache(self) -> Optional[PromptCache]:
+        """Create a reusable prompt cache. None if backend doesn't support it."""
+        if not self.ctx.backend.supports_prompt_cache():
+            return None
+        return self.ctx.backend.make_prompt_cache()
+
+    def generate(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        cache: Optional[PromptCache] = None,
+    ) -> Iterator[Token]:
         meter = TokRateMeter()
         for t in self.ctx.techniques:
             t.on_generation_start(self.ctx)
-        self.ctx.recorder.record("generation_start", prompt_len=len(prompt))
+        self.ctx.recorder.record(
+            "generation_start",
+            prompt_len=len(prompt),
+            cache_reused=cache is not None,
+        )
+        t_start = time.monotonic()
+        first_token_seen = False
         try:
-            for tok in self.ctx.backend.generate(prompt, settings):
+            for tok in self.ctx.backend.generate(prompt, settings, prompt_cache=cache):
+                if not first_token_seen:
+                    self.ctx.recorder.record("prefill_done", prefill_s=time.monotonic() - t_start)
+                    first_token_seen = True
                 meter.tick()
                 state = StepState(token_idx=meter.count)
                 # on_route is invoked by the backend via set_route_callback once
