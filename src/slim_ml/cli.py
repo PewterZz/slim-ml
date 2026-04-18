@@ -310,6 +310,105 @@ def spec_sweep(
 
 
 @app.command()
+def pld(
+    model: str = typer.Argument(..., help="HF repo id or local path (MLX)"),
+    prompt: str = typer.Option(
+        "Write a Python function that takes a list of integers and returns "
+        "the median. Handle even-length lists by averaging the two middle "
+        "elements. Include a docstring and type hints."
+    ),
+    num_draft: int = typer.Option(4, help="Max draft tokens per verify round (variable)"),
+    max_ngram: int = typer.Option(3, help="Max n-gram size to match against history"),
+    min_ngram: int = typer.Option(2, help="Min n-gram size before giving up"),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0, help="0.0 enables correctness gate vs baseline"),
+    compare_baseline: bool = typer.Option(
+        True, help="Also run non-speculative baseline and report speedup"
+    ),
+    headroom_gb: float = typer.Option(4.0),
+    log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
+):
+    """Prompt Lookup Decoding — draftless speculation via n-gram match.
+
+    MLX-only. No draft model. Drafts come from searching the prompt + what's
+    been generated for the last n-gram's earlier occurrence and taking what
+    followed. Fast path is code / refactor workloads with context-local repeats.
+    """
+    be = MLXBackend()
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    recorder = JsonlRecorder(log) if log else NullRecorder()
+
+    console.print(f"[cyan]loading[/cyan] {model}")
+    be.load(model, None, budget)
+
+    session = Session(backend=be, budget=budget, recorder=recorder)
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+
+    try:
+        if compare_baseline:
+            t0 = time.monotonic()
+            base_tokens: list[int] = []
+            for tok in session.generate(prompt, settings):
+                base_tokens.append(tok.token_id)
+            t_base = time.monotonic() - t0
+            n_base = len(base_tokens)
+            console.print(
+                f"[bold]baseline[/bold] tokens={n_base} time={t_base:.2f}s "
+                f"tps={n_base / t_base:.1f}"
+            )
+
+        t0 = time.monotonic()
+        pld_tokens: list[int] = []
+        pld_text: list[str] = []
+        accepted = 0
+        n = 0
+        for tok in session.generate_pld_speculative(
+            prompt,
+            settings,
+            num_draft=num_draft,
+            max_ngram_size=max_ngram,
+            min_ngram_size=min_ngram,
+        ):
+            pld_tokens.append(tok.token_id)
+            pld_text.append(tok.text)
+            if tok.from_draft:
+                accepted += 1
+            if tok.token_id != -1:
+                n += 1
+        t_pld = time.monotonic() - t0
+        tps = n / t_pld if t_pld > 0 else 0.0
+        accept_rate = (accepted / n) * 100 if n else 0.0
+        console.print(
+            f"[bold]pld[/bold]      tokens={n} time={t_pld:.2f}s "
+            f"tps={tps:.1f}  from_draft={accept_rate:.1f}%"
+        )
+
+        if compare_baseline:
+            speedup = t_base / t_pld if t_pld > 0 else 0.0
+            console.print(f"[green]speedup {speedup:.2f}×[/green]")
+            if temperature == 0.0:
+                m = min(len(base_tokens), len(pld_tokens))
+                diverge = next((i for i in range(m) if base_tokens[i] != pld_tokens[i]), None)
+                if diverge is None and len(base_tokens) == len(pld_tokens):
+                    console.print(f"[green]correctness: {m} tokens identical[/green]")
+                elif diverge is None:
+                    console.print(
+                        f"[yellow]correctness: prefix {m} match, lengths differ "
+                        f"base={len(base_tokens)} pld={len(pld_tokens)}[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"[red]correctness FAIL at idx {diverge}: "
+                        f"base={base_tokens[diverge]} pld={pld_tokens[diverge]}[/red]"
+                    )
+
+        console.print(f"\n[dim]{''.join(pld_text)[:200]}[/dim]")
+    finally:
+        session.close()
+
+
+@app.command()
 def techniques():
     """List registered techniques and their implementation status."""
     table = Table(title="Techniques")

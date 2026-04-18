@@ -99,6 +99,21 @@ class Backend(ABC):
     ) -> Iterator["Token"]:
         raise NotImplementedError(f"{self.name}: speculative decoding not implemented")
 
+    def supports_pld(self) -> bool:
+        return False
+
+    def generate_pld_speculative(
+        self,
+        prompt: str,
+        settings: "GenerationSettings",
+        num_draft: int,
+        prompt_cache: Optional["PromptCache"] = None,
+        recorder: Optional[Callable[[str, dict], None]] = None,
+        max_ngram_size: int = 3,
+        min_ngram_size: int = 2,
+    ) -> Iterator["Token"]:
+        raise NotImplementedError(f"{self.name}: PLD decoding not implemented")
+
     def migrate_expert(self, layer_idx: int, expert_id: int, to_tier: Tier) -> None:
         raise NotImplementedError(f"{self.name}: expert migration not implemented")
 
@@ -200,6 +215,9 @@ class MLXBackend(Backend):
     def supports_speculative(self) -> bool:
         return self._model is not None and self._draft_model is not None
 
+    def supports_pld(self) -> bool:
+        return self._model is not None
+
     def _iter_moe_switch_layers(self):
         if self._model is None:
             return
@@ -274,6 +292,56 @@ class MLXBackend(Backend):
             max_tokens=settings.max_tokens,
             sampler=sampler,
             prompt_cache=prompt_cache,
+            recorder=recorder,
+        )
+        for token_id, _lp, from_draft in gen:
+            tid = int(token_id)
+            if tid in eos_ids:
+                break
+            detok.add_token(tid)
+            yield Token(
+                text=detok.last_segment,
+                token_id=tid,
+                logprob=None,
+                from_draft=bool(from_draft),
+            )
+        detok.finalize()
+        tail = detok.last_segment
+        if tail:
+            yield Token(text=tail, token_id=-1, logprob=None, from_draft=None)
+
+    def generate_pld_speculative(
+        self,
+        prompt: str,
+        settings: GenerationSettings,
+        num_draft: int,
+        prompt_cache: Optional[PromptCache] = None,
+        recorder: Optional[Callable[[str, dict], None]] = None,
+        max_ngram_size: int = 3,
+        min_ngram_size: int = 2,
+    ) -> Iterator[Token]:
+        if self._model is None:
+            raise RuntimeError("model not loaded")
+        import mlx.core as mx
+        from mlx_lm.sample_utils import make_sampler
+
+        from .spec_decode import speculative_step_pld
+
+        sampler = make_sampler(temp=settings.temperature, top_p=settings.top_p)
+        prompt_ids = mx.array(self._tokenizer.encode(prompt), mx.uint32)
+        detok = self._tokenizer.detokenizer
+        detok.reset()
+        eos_ids = self._tokenizer.eos_token_ids
+
+        gen = speculative_step_pld(
+            prompt_ids,
+            self._model,
+            num_draft_tokens=num_draft,
+            max_tokens=settings.max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            max_ngram_size=max_ngram_size,
+            min_ngram_size=min_ngram_size,
             recorder=recorder,
         )
         for token_id, _lp, from_draft in gen:

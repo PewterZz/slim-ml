@@ -21,6 +21,7 @@ Early scaffold. What works end-to-end today:
 - `slim-ml run MODEL` — MLX backend generation with t/s telemetry (OmniCoder 9B etc.)
 - `slim-ml bench MODEL` — prompt cache reuse benchmark (~6.4× TTFT on turn 2)
 - `slim-ml spec MODEL --draft DRAFT` — speculative decoding with correctness gate and per-round telemetry
+- `slim-ml pld MODEL` — draftless Prompt Lookup Decoding (n-gram match against context) with correctness gate
 
 What's interface-only (NotImplementedError):
 - Expert caching migration (hot-set selection + tier moves; observation hook below is shipped)
@@ -88,6 +89,42 @@ for tok in session.generate_speculative(
 With `log=<path>.jsonl` on the `Session`, each verify round emits a
 `spec_round` event with `{num_draft, num_accept, verify_ms, replay_ms}` for
 per-round profiling.
+
+## Prompt Lookup Decoding (PLD)
+
+Same speculative verifier, but drafts come from n-gram matching the
+prompt + already-generated tokens instead of a draft model. Zero extra
+parameters, zero draft-model load time. Win condition is context-local
+repetition (field names, repeated method structure, refactors) — exactly
+the shape of most coding and editing workloads.
+
+```bash
+slim-ml pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --prompt "Implement to_dict, from_dict, __repr__, __eq__ for this dataclass..." \
+  --num-draft 8 \
+  --max-tokens 192 \
+  --temperature 0.0
+```
+
+Measured on M3 Air 16GB (April 2026, Qwen2.5-Coder-7B 4bit, temp=0, 192
+tokens, num_draft=8):
+
+| mode | tps | speedup | correctness |
+|---|---|---|---|
+| baseline | 17.7 | 1.00× | — |
+| pld      | 24.4 | **1.38×** | 192/192 tokens identical |
+
+Per-round telemetry for that run: 87 rounds, 63 of which found no n-gram
+match and degraded to a plain step; of the 24 rounds that did propose
+drafts, 63.5% of drafts were accepted. Ceiling rises on edit-shaped
+workloads (rename refactor, docstring pass) where the model output
+heavily mirrors the prompt. This is the first PLD port to MLX that I'm
+aware of — PROMTEC's 4.23× figure (HumanEval edit tasks) is the theoretical
+ceiling, not what generate-from-scratch on a laptop will hit.
+
+The implementation (`src/slim_ml/prompt_lookup.py` + `speculative_step_pld`
+in `spec_decode.py`) shares the same snapshot/restore machinery as the
+draft-model path, so it works on hybrid-attention models too.
 
 ## KV cache quantization
 
