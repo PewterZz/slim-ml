@@ -1,0 +1,43 @@
+language: "en-US"
+early_access: false
+tone_instructions: "Be concise. Focus on correctness, security, and performance. Skip style nits that ruff/black would catch."
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+  path_filters:
+    - "!**/*.gguf"
+    - "!**/*.safetensors"
+    - "!**/*.bin"
+    - "!**/*.jsonl"
+    - "!.venv/**"
+    - "!dist/**"
+    - "!build/**"
+  path_instructions:
+    - path: "src/slim_ml/backend.py"
+      instructions: |
+        This is the Backend ABC boundary. Flag any breaking changes to method signatures
+        or supports_* capability flags. Both MLXBackend and LlamaCppBackend must remain
+        in sync with the ABC.
+    - path: "src/slim_ml/runtime.py"
+      instructions: |
+        Session owns the generation loop. Flag any changes that could silently drop
+        telemetry events (generation_start, prefill_done, tps, generation_end) or
+        break the Technique lifecycle hooks (attach, on_generation_start, after_step,
+        on_generation_end, detach).
+    - path: "tests/**"
+      instructions: |
+        Tests should hit real backends where possible. Flag mocks that bypass the
+        Backend ABC — they defeat the purpose of integration coverage.
+
+chat:
+  auto_reply: true
