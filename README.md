@@ -6,6 +6,58 @@ Targets the cases current tools do poorly:
 - 30-80B MoE models (A3B-style) on a laptop with 6-8GB VRAM + DDR4 RAM
 - Dense models on M-series Macs where unified memory pressure fluctuates with your workflow
 
+## Quickstart
+
+Pick the path that matches your machine. Both use the same `slim-ml` CLI.
+
+### Mac (MLX)
+
+```bash
+pip install -e ".[mlx]"
+
+# 1. Fastest decoding on coding/edit workloads (no draft model needed)
+slim-ml pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+
+# 2. Best speedup if you have a small draft model of the same family
+slim-ml spec mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --draft mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit
+
+# 3. Plain generation with good defaults
+slim-ml run <mlx-model>
+```
+
+Don't know which draft pair works for your target? `slim-ml spec-sweep` tries
+`num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
+
+### Linux + NVIDIA GPU (llama.cpp)
+
+```bash
+pip install -e ".[llama]"
+
+# Find the highest-tps llama-server config that fits your GPU.
+# Prints a ready-to-paste llama-server command with the winning settings.
+slim-ml lc-sweep models/YOUR_MODEL.gguf \
+  --server-bin ./build-linux/bin/llama-server
+
+# Dry-run: inspect candidate configs without launching anything.
+slim-ml lc-probe models/YOUR_MODEL.gguf
+```
+
+Measured wins on a RTX 3060 Laptop 6 GB: **+35%** on OmniCoder 9B (24 → 32.3 t/s),
+**+22%** on Qwen3.6-35B-A3B MoE (26 → 31.6 t/s). Detail + tables in the
+[Linux/CUDA autoconfig](#linux--cuda-autoconfig-lc-probe-lc-sweep) section.
+
+### Which technique for which workload?
+
+| your situation | reach for |
+|---|---|
+| Mac, writing new code | `spec` (target + small draft of same family) |
+| Mac, editing / refactoring existing code | `pld` (draftless; wins from prompt repetition) |
+| Mac, long-context edit + wants correctness gate | `pld --temperature 0.0` (auto baseline diff) |
+| Linux laptop GPU, just want best t/s | `lc-sweep` then paste the winning command |
+| Linux laptop GPU, MoE model (A3B-style) | `lc-sweep` — it's MoE-aware, sweeps `--n-cpu-moe` |
+| Investigating an MoE's routing skew | `tools/routing_observe.py` |
+
 ## Approach
 
 A scheduling/orchestration layer on top of proven kernels (MLX on Mac, llama.cpp on Linux). Value-add is not new matmul — it's:
@@ -283,6 +335,104 @@ VRAM/RAM bandwidth gap to exploit anyway — tiered placement is a
 gaming-laptop-with-dGPU payoff, not an Apple Silicon one. The observation
 scaffold exists on both; migration is gated on a target with the memory
 topology to make it worthwhile.
+
+The **llama.cpp/CUDA path** is a different story — the RTX 3060 laptop has a
+~336 GB/s VRAM vs ~4 GB/s PCIe Gen3 x4 bandwidth gap that tiered placement can
+exploit. RFC drafted at [`docs/expert-cache-rfc.md`](docs/expert-cache-rfc.md):
+LRU cache of hot experts in GPU VRAM in front of the current `--n-cpu-moe`
+CPU-resident tensors, intercepted at `ggml_cuda_mul_mat_id`. Gated on a
+premise-check showing Qwen3.6-35B-A3B routing skew beats the 30% top-10%
+threshold on a coding workload — OLMoE came in at 26.2% so the threshold is
+real, not ornamental.
+
+## Linux / CUDA autoconfig (`lc-probe`, `lc-sweep`)
+
+The MLX path has the interesting kernels; the Linux path has a different
+problem — `llama-server` on a 6-8 GB consumer card is a dance of
+`--n-gpu-layers`, `--batch-size`, `--ctx-size`, and `-ctk/-ctv` flags where
+the wrong combo fails to load, loads but OOMs mid-generation, or loads but
+leaves 2 GB of VRAM unused. The sweep tool turns that from restart-and-guess
+into probe-and-measure.
+
+```bash
+# 1. Inspect a GGUF and see what configs would fit in VRAM
+slim-ml lc-probe models/OmniCoder-9B-Q4_K_M.gguf --ctx-target 32000
+
+# 2. Actually launch each candidate, time 96 tokens, kill, report
+slim-ml lc-sweep models/OmniCoder-9B-Q4_K_M.gguf \
+  --server-bin ./build-linux/bin/llama-server \
+  --ctx-target 32000 --max-configs 6 \
+  --log-dir /tmp/sweep-logs
+```
+
+`lc-probe` reads the GGUF header (block count, hidden size, head count) and
+queries `nvidia-smi` for total VRAM, then bisects `--n-gpu-layers` against a
+coarse VRAM estimator at three (batch, ctx) points. The estimator is
+intentionally approximate — its only job is narrowing the search from 40
+values to 6.
+
+`lc-sweep` runs each candidate end-to-end: fresh `llama-server` process,
+wait for `/health`, warmup completion, timed completion via `/completion`
+(reads `timings.predicted_per_second`). Kill the server (SIGTERM then
+SIGKILL) before moving on so CUDA contexts don't stack. Each run costs
+~30-90 s, mostly model load. Per-run stderr lands in `--log-dir` so OOM
+crashes can be inspected.
+
+The tool is deliberately blunt — no binary-search across gpu-layers to find
+the exact maximum. Candidates come pre-bisected from the VRAM estimator,
+sweep just validates which actually launch and which deliver the most t/s.
+
+**Measured on this laptop** (RTX 3060 Laptop 6 GB, Ryzen 7 5800H, DDR4-3200):
+
+_OmniCoder 9B Q4_K_M (dense, hybrid attention), 96 tokens, `--spec-type ngram-mod`_:
+
+| ngl | ctx | batch | tps | prefill tps | vram peak |
+|-----|-----|-------|-----|-------------|-----------|
+| 34 (all) | 16000 | 256 | **32.3** | 386 | 5878 |
+| 34 (all) | 16000 | 128 | 31.7 | 381 | 5752 |
+| 34 (all) | 8000 | 256 | 31.5 | 382 | 5808 |
+| 33 | 32000 | 256 | 30.9 | 381 | 6014 |
+
+User's prior hand-tuned config (ngl=28, ctx=32000, batch=512) was 24 t/s.
+Sweep-picked winner is **32.3 t/s — +35%**. The lever the sweep found:
+drop ctx 32000→16000 to free ~140 MiB of KV cache, which buys enough
+headroom to land all 34 layers on GPU. With no CPU-resident layers, the
+bottleneck moves from DDR4 (~40 GB/s) to VRAM (~336 GB/s).
+
+_Qwen3.6-35B-A3B UD-Q2_K_XL (MoE, 256 experts / 8 active), 64 tokens,
+`--spec-type ngram-mod`_:
+
+| n_cpu_moe | ctx | batch | tps | prefill tps | vram peak |
+|-----------|-----|-------|-----|-------------|-----------|
+| 26 (14 on GPU) | 16000 | 256 | **31.6** | 73 | 5926 |
+| 27 (13 on GPU) | 32000 | 256 | 29.5 | 64 | 5766 |
+| 28 (12 on GPU) | 32000 | 512 | 28.3 | 60 | 5768 |
+| 28 (12 on GPU) | 16000 | 512 | 27.3 | 59 | 5682 |
+| 31 (9 on GPU)  | 16000 | 1024 | 25.9 | 54 | 5434 |
+
+User's prior config pinned all 40 MoE expert layers to CPU
+(`--n-cpu-moe 33` on a 40-layer model effectively means "all experts on
+CPU"). The sweep says landing 14 of 40 expert layers on GPU is worth
+**+22% t/s** at the cost of dropping ctx to 16K. Prefill stays modest at
+MoE (~70 t/s) because only 8/256 experts activate per token — compute
+is sparse, memory bandwidth for the active expert weights is still the
+binding constraint.
+
+The sweep also encodes some honest tradeoffs. Bigger batch (`--batch-size
+1024`) shaves 20% off generation tps on MoE because the compute-buffer
+scratch displaces expert weights off GPU. The prior hand-tuned config ran
+128K context — worth it if you need long context, but the sweep shows
+what you trade for it.
+
+### Why not just binary-search n-gpu-layers?
+
+Because the variable you actually want to pick is closer to "which (ngl,
+batch, ctx, kv-quant) combination maximizes t/s without crashing on the
+second request." Load succeeds is necessary but not sufficient — the
+user hit a case earlier tonight where load + first request succeeded at
+`--batch-size 1024 --n-gpu-layers 32`, then the second request OOM'd in
+flash attention scratch. The sweep catches that by requiring two
+completions (warmup + measured).
 
 ## Install
 

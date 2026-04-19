@@ -514,11 +514,164 @@ def techniques():
     """List registered techniques and their implementation status."""
     table = Table(title="Techniques")
     table.add_column("Name"); table.add_column("Target"); table.add_column("Status")
-    table.add_row("expert_cache", "v0", "interface sketched")
+    table.add_row("expert_cache", "v0", "RFC drafted (docs/expert-cache-rfc.md), premise-check pending")
     table.add_row("spec_decode", "v1", "shipped (MLX, hybrid-attention supported)")
     table.add_row("kv_quant", "v2", "runtime knob shipped (--kv-bits); Technique interface TBD")
     table.add_row("layer_stream", "v2", "stub")
+    table.add_row("lc_autoconfig", "linux", "shipped (slim-ml lc-probe / lc-sweep)")
     console.print(table)
+
+
+@app.command("lc-probe")
+def lc_probe(
+    model: str = typer.Argument(..., help="Path to GGUF model file"),
+    ctx_target: int = typer.Option(32000, help="Target context length"),
+    vram_mib: Optional[int] = typer.Option(
+        None, help="Override free VRAM in MiB (otherwise probe nvidia-smi)"
+    ),
+    assume_total_vram: bool = typer.Option(
+        True, help="Assume total VRAM (full GPU) instead of current free VRAM"
+    ),
+    safety_mib: int = typer.Option(200, help="VRAM safety margin"),
+    top_n: int = typer.Option(8, help="Show top-N candidate configs"),
+):
+    """Probe a GGUF model + current GPU and print candidate llama-server configs.
+
+    Use this before `lc-sweep` to sanity check what configs will be tried.
+    Linux/CUDA only — MLX users should use `run` / `spec` etc.
+    """
+    from .llamacpp_config import (
+        query_nvidia_gpus,
+        read_gguf_info,
+        suggest_configs,
+    )
+
+    info = read_gguf_info(model)
+    console.print(
+        f"[bold]{info.path.name}[/bold]  arch={info.architecture}  "
+        f"blocks={info.block_count}  ctx_train={info.context_length}"
+    )
+    console.print(
+        f"  heads={info.head_count}/{info.head_count_kv}  "
+        f"embed={info.embedding_length}  size={info.file_size_bytes/(1024**3):.2f} GiB"
+    )
+
+    if vram_mib is not None:
+        free = vram_mib
+        console.print(f"[dim]using vram_mib override = {vram_mib} MiB[/dim]")
+    else:
+        gpus = query_nvidia_gpus()
+        if not gpus:
+            console.print("[red]no NVIDIA GPU detected; pass --vram-mib[/red]")
+            raise typer.Exit(code=1)
+        g = gpus[0]
+        free = g.total_mib if assume_total_vram else g.free_mib
+        label = "total" if assume_total_vram else "free"
+        console.print(
+            f"[dim]gpu[0]={g.name}  {label}={free} MiB "
+            f"(current_free={g.free_mib}, total={g.total_mib})[/dim]"
+        )
+
+    cfgs = suggest_configs(info, free_vram_mib=free,
+                           vram_safety_mib=safety_mib, ctx_target=ctx_target)
+    table = Table(title=f"Candidate configs (budget={max(0, free - safety_mib)} MiB)")
+    table.add_column("rank", justify="right")
+    table.add_column("n_gpu_layers", justify="right")
+    table.add_column("ctx", justify="right")
+    table.add_column("batch", justify="right")
+    table.add_column("est VRAM MiB", justify="right")
+    table.add_column("notes")
+    for i, c in enumerate(cfgs[:top_n], 1):
+        table.add_row(
+            str(i), str(c.n_gpu_layers), str(c.ctx_size), str(c.batch_size),
+            str(c.est_vram_mib), c.notes,
+        )
+    console.print(table)
+
+    if not cfgs:
+        console.print("[yellow]No config fits in the given VRAM budget.[/yellow]")
+
+
+@app.command("lc-sweep")
+def lc_sweep(
+    model: str = typer.Argument(..., help="Path to GGUF model file"),
+    server_bin: str = typer.Option(
+        "./build-linux/bin/llama-server",
+        help="Path to llama-server binary",
+    ),
+    ctx_target: int = typer.Option(32000),
+    vram_mib: Optional[int] = typer.Option(
+        None, help="Override VRAM in MiB (otherwise use total VRAM)"
+    ),
+    safety_mib: int = typer.Option(200),
+    max_configs: int = typer.Option(6, help="Max configs to try"),
+    n_predict: int = typer.Option(96, help="Tokens to generate for timing"),
+    port: int = typer.Option(8090),
+    threads: Optional[int] = typer.Option(8),
+    prompt: str = typer.Option(
+        "Write a Python function that takes a list of integers and returns "
+        "the median. Handle even-length lists by averaging the two middle "
+        "elements. Include a docstring and type hints.",
+    ),
+    log_dir: Optional[str] = typer.Option(None, help="Dir for per-run server logs"),
+    jsonl: Optional[str] = typer.Option(None, help="Write results as JSONL"),
+):
+    """Sweep llama-server configs to find the highest-tps config that fits.
+
+    Each config launches a fresh llama-server, warms up, times a completion,
+    then kills the server. Expect ~30-90s per config (dominated by load time).
+
+    Before running: make sure nothing else is holding your GPU (stop any
+    running llama-server on port 8080 etc.).
+    """
+    from pathlib import Path as _Path
+
+    from .lc_sweep import auto_sweep
+
+    console.print(f"[cyan]sweeping[/cyan] {model}")
+    ld = _Path(log_dir) if log_dir else None
+    rep = auto_sweep(
+        model_path=model, server_bin=server_bin,
+        ctx_target=ctx_target, vram_override_mib=vram_mib,
+        vram_safety_mib=safety_mib, max_configs=max_configs,
+        port=port, threads=threads, n_predict=n_predict,
+        prompt=prompt, log_dir=ld,
+    )
+
+    table = Table(title=f"Sweep results — {_Path(model).name}")
+    for col in ("ngl", "ctx", "batch", "tps", "prefill", "vram peak", "load s", "status"):
+        table.add_column(col, justify="right")
+    for r in rep.results:
+        status = "ok" if r.ok else f"FAIL: {r.error[:40]}"
+        tps = f"{r.tps:.1f}" if r.ok else "—"
+        prefill = f"{r.prefill_tps:.0f}" if r.ok else "—"
+        vram = f"{r.vram_peak_mib}" if r.ok else "—"
+        load = f"{r.load_s:.1f}"
+        table.add_row(
+            str(r.config.n_gpu_layers), str(r.config.ctx_size),
+            str(r.config.batch_size), tps, prefill, vram, load, status,
+        )
+    console.print(table)
+
+    w = rep.winner
+    if w is not None:
+        console.print(
+            f"\n[green]winner:[/green] ngl={w.config.n_gpu_layers} "
+            f"ctx={w.config.ctx_size} batch={w.config.batch_size} "
+            f"→ {w.tps:.1f} t/s (prefill {w.prefill_tps:.0f} t/s)"
+        )
+        console.print("\n[bold]Suggested llama-server invocation:[/bold]")
+        cmd = [server_bin] + w.config.to_args(
+            model_path=model, port=8080, host="0.0.0.0",
+            threads=threads,
+        )
+        console.print(" ".join(cmd))
+    else:
+        console.print("[red]No config succeeded. Check --log-dir tail for errors.[/red]")
+
+    if jsonl:
+        rep.to_jsonl(_Path(jsonl))
+        console.print(f"[dim]jsonl written: {jsonl}[/dim]")
 
 
 if __name__ == "__main__":

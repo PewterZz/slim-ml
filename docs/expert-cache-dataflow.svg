@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 880" font-family="sans-serif" font-size="18">
+  <defs>
+    <marker id="head-hot" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c92a2a"/>
+    </marker>
+    <marker id="head-miss" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#868e96"/>
+    </marker>
+    <marker id="head-hit" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2b8a3e"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="880" fill="#ffffff"/>
+
+  <!-- ======= TODAY ======= -->
+  <text x="100" y="50" font-size="26" font-weight="700" fill="#1e1e1e">Today — --n-cpu-moe N  (experts pinned to CPU)</text>
+
+  <!-- CPU box today -->
+  <rect x="100" y="100" width="260" height="200" rx="10" ry="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="230" y="132" text-anchor="middle" font-size="17" font-weight="700" fill="#1e1e1e">CPU RAM</text>
+  <text x="230" y="156" text-anchor="middle" font-size="15" fill="#495057">~40 GB/s (DDR4)</text>
+  <text x="230" y="200" text-anchor="middle" font-size="17" fill="#1e1e1e">Expert tensors</text>
+  <text x="230" y="224" text-anchor="middle" font-size="17" fill="#1e1e1e">all 256 × N layers</text>
+  <text x="230" y="248" text-anchor="middle" font-size="17" fill="#1e1e1e">pinned permanently</text>
+
+  <!-- Arrow today -->
+  <path d="M 360 200 L 770 200" stroke="#c92a2a" stroke-width="3" fill="none" marker-end="url(#head-hot)"/>
+  <text x="565" y="178" text-anchor="middle" font-size="16" fill="#c92a2a" font-weight="600">PCIe ~4 GB/s</text>
+  <text x="565" y="196" text-anchor="middle" font-size="16" fill="#c92a2a">8 experts/layer · every token</text>
+
+  <!-- GPU box today -->
+  <rect x="790" y="100" width="260" height="200" rx="10" ry="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="920" y="132" text-anchor="middle" font-size="17" font-weight="700" fill="#1e1e1e">GPU VRAM (RTX 3060)</text>
+  <text x="920" y="156" text-anchor="middle" font-size="15" fill="#495057">~336 GB/s</text>
+  <text x="920" y="212" text-anchor="middle" font-size="17" fill="#1e1e1e">mmid kernel</text>
+  <text x="920" y="236" text-anchor="middle" font-size="15" fill="#495057">(compacted matmul)</text>
+
+  <text x="100" y="355" font-size="19" fill="#c92a2a" font-weight="700">→ Bottleneck: PCIe paid on 100% of tokens</text>
+
+  <!-- DIVIDER -->
+  <line x1="80" y1="400" x2="1120" y2="400" stroke="#adb5bd" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <!-- ======= PROPOSED ======= -->
+  <text x="100" y="450" font-size="26" font-weight="700" fill="#1e1e1e">Proposed — LRU expert cache in VRAM</text>
+
+  <!-- CPU box new -->
+  <rect x="100" y="500" width="260" height="200" rx="10" ry="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="230" y="532" text-anchor="middle" font-size="17" font-weight="700" fill="#1e1e1e">CPU RAM (cold tier)</text>
+  <text x="230" y="590" text-anchor="middle" font-size="17" fill="#1e1e1e">All 256 experts</text>
+  <text x="230" y="614" text-anchor="middle" font-size="17" fill="#1e1e1e">still live here —</text>
+  <text x="230" y="638" text-anchor="middle" font-size="17" fill="#1e1e1e">source of truth</text>
+
+  <!-- GPU outer box -->
+  <rect x="540" y="470" width="600" height="260" rx="10" ry="10" fill="#e7f5ff" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="560" y="494" font-size="16" font-weight="700" fill="#1e1e1e">GPU VRAM  ~336 GB/s</text>
+
+  <!-- LRU cache inner -->
+  <rect x="560" y="510" width="240" height="200" rx="10" ry="10" fill="#a5d8ff" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="680" y="542" text-anchor="middle" font-size="18" font-weight="700" fill="#1e1e1e">LRU cache</text>
+  <text x="680" y="588" text-anchor="middle" font-size="17" fill="#1e1e1e">K hot experts</text>
+  <text x="680" y="612" text-anchor="middle" font-size="17" fill="#1e1e1e">× N layers</text>
+  <text x="680" y="656" text-anchor="middle" font-size="15" fill="#495057">~2–4 GiB budget</text>
+
+  <!-- mmid inner -->
+  <rect x="880" y="510" width="240" height="200" rx="10" ry="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+  <text x="1000" y="542" text-anchor="middle" font-size="18" font-weight="700" fill="#1e1e1e">mmid kernel</text>
+  <text x="1000" y="564" text-anchor="middle" font-size="14" fill="#495057">(unchanged)</text>
+  <text x="1000" y="622" text-anchor="middle" font-size="17" fill="#1e1e1e">Consumes weights</text>
+  <text x="1000" y="646" text-anchor="middle" font-size="17" fill="#1e1e1e">from cache on hit</text>
+
+  <!-- Arrow CPU → cache (miss, dashed) -->
+  <path d="M 360 605 L 555 605" stroke="#868e96" stroke-width="2" stroke-dasharray="8 5" fill="none" marker-end="url(#head-miss)"/>
+  <text x="457" y="568" text-anchor="middle" font-size="15" fill="#495057" font-weight="600">miss (1 − H)</text>
+  <text x="457" y="588" text-anchor="middle" font-size="13" fill="#868e96">PCIe fetch + LRU evict</text>
+
+  <!-- Arrow cache → mmid (hit, bold) -->
+  <path d="M 800 610 L 875 610" stroke="#2b8a3e" stroke-width="3" fill="none" marker-end="url(#head-hit)"/>
+  <text x="837" y="600" text-anchor="middle" font-size="15" font-weight="700" fill="#2b8a3e">hit (H)</text>
+
+  <text x="100" y="780" font-size="19" fill="#2b8a3e" font-weight="700">→ Bottleneck moves: PCIe only on miss (1 − H)</text>
+  <text x="100" y="812" font-size="15" fill="#495057">ceiling ≈ 1 / (1 − C + C·(1 − H + H/R))    C = MoE fraction of per-token time · H = hit rate · R = VRAM/PCIe speed ratio</text>
+</svg>
